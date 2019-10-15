@@ -254,6 +254,9 @@ func (a *Agent) gatherCandidatesLocal(networkTypes []NetworkType) {
 }
 
 func (a *Agent) gatherCandidatesSrflx(urls []*URL, networkTypes []NetworkType) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	var stunURLs []*URL
 	for _, url := range urls {
 		if url.Scheme == SchemeTypeSTUN {
@@ -264,60 +267,61 @@ func (a *Agent) gatherCandidatesSrflx(urls []*URL, networkTypes []NetworkType) {
 	for _, networkType := range networkTypes {
 		network := networkType.String()
 		if len(stunURLs) > 0 {
-			for _, url := range stunURLs {
-				if url.Scheme != SchemeTypeSTUN {
-					continue
-				}
+			for _, val := range stunURLs {
+				wg.Add(1)
+				go func(url *URL) {
+					defer wg.Done()
 
-				hostPort := fmt.Sprintf("%s:%d", url.Host, url.Port)
-				serverAddr, err := a.net.ResolveUDPAddr(network, hostPort)
-				if err != nil {
-					a.log.Warnf("failed to resolve stun host: %s: %v", hostPort, err)
-					continue
-				}
-
-				conn, err := a.listenUDP(int(a.portmax), int(a.portmin), network, &net.UDPAddr{IP: nil, Port: 0})
-				if err != nil {
-					a.log.Warnf("Failed to listen for %s: %v\n", serverAddr.String(), err)
-					continue
-				}
-
-				xoraddr, err := getXORMappedAddr(conn, serverAddr, stunGatherTimeout)
-				if err != nil {
-					a.log.Warnf("could not get server reflexive address %s %s: %v\n", network, url, err)
-					continue
-				}
-
-				laddr := conn.LocalAddr().(*net.UDPAddr)
-				ip := xoraddr.IP
-				port := xoraddr.Port
-				relIP := laddr.IP.String()
-				relPort := laddr.Port
-
-				srflxConfig := CandidateServerReflexiveConfig{
-					Network:   network,
-					Address:   ip.String(),
-					Port:      port,
-					Component: ComponentRTP,
-					RelAddr:   relIP,
-					RelPort:   relPort,
-				}
-				c, err := NewCandidateServerReflexive(&srflxConfig)
-				if err != nil {
-					a.log.Warnf("Failed to create server reflexive candidate: %s %s %d: %v\n", network, ip, port, err)
-					continue
-				}
-
-				if err := a.run(func(agent *Agent) {
-					c.start(a, conn)
-					a.addCandidate(c)
-
-					if a.onCandidateHdlr != nil {
-						go a.onCandidateHdlr(c)
+					hostPort := fmt.Sprintf("%s:%d", url.Host, url.Port)
+					serverAddr, err := a.net.ResolveUDPAddr(network, hostPort)
+					if err != nil {
+						a.log.Warnf("failed to resolve stun host: %s: %v", hostPort, err)
+						return
 					}
-				}); err != nil {
-					a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v\n", err)
-				}
+
+					conn, err := a.listenUDP(int(a.portmax), int(a.portmin), network, &net.UDPAddr{IP: nil, Port: 0})
+					if err != nil {
+						a.log.Warnf("Failed to listen for %s: %v\n", serverAddr.String(), err)
+						return
+					}
+
+					xoraddr, err := getXORMappedAddr(conn, serverAddr, stunGatherTimeout)
+					if err != nil {
+						a.log.Warnf("could not get server reflexive address %s %s: %v\n", network, url, err)
+						return
+					}
+
+					laddr := conn.LocalAddr().(*net.UDPAddr)
+					ip := xoraddr.IP
+					port := xoraddr.Port
+					relIP := laddr.IP.String()
+					relPort := laddr.Port
+
+					srflxConfig := CandidateServerReflexiveConfig{
+						Network:   network,
+						Address:   ip.String(),
+						Port:      port,
+						Component: ComponentRTP,
+						RelAddr:   relIP,
+						RelPort:   relPort,
+					}
+					c, err := NewCandidateServerReflexive(&srflxConfig)
+					if err != nil {
+						a.log.Warnf("Failed to create server reflexive candidate: %s %s %d: %v\n", network, ip, port, err)
+						return
+					}
+
+					if err := a.run(func(agent *Agent) {
+						c.start(a, conn)
+						a.addCandidate(c)
+
+						if a.onCandidateHdlr != nil {
+							go a.onCandidateHdlr(c)
+						}
+					}); err != nil {
+						a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v\n", err)
+					}
+				}(val)
 			}
 		} else if a.extIPMapper != nil && a.extIPMapper.candidateType == CandidateTypeServerReflexive {
 			conn, err := a.listenUDP(int(a.portmax), int(a.portmin), network, &net.UDPAddr{IP: nil, Port: 0})
@@ -367,107 +371,118 @@ func (a *Agent) gatherCandidatesSrflx(urls []*URL, networkTypes []NetworkType) {
 }
 
 func (a *Agent) gatherCandidatesRelay(urls []*URL) error {
-	network := NetworkTypeUDP4.String() // TODO IPv6
-	for _, url := range urls {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	for _, val := range urls {
 		switch {
-		case url.Scheme != SchemeTypeTURN:
+		case val.Scheme != SchemeTypeTURN:
 			continue
-		case url.Username == "":
+		case val.Username == "":
 			return ErrUsernameEmpty
-		case url.Password == "":
+		case val.Password == "":
 			return ErrPasswordEmpty
 		}
+		wg.Add(1)
 
-		TURNServerAddr := fmt.Sprintf("%s:%d", url.Host, url.Port)
-		var (
-			locConn net.PacketConn
-			err     error
-			RelAddr string
-			RelPort int
-		)
+		go func(url *URL) {
+			defer wg.Done()
 
-		if url.Proto == ProtoTypeUDP {
-			locConn, err = a.net.ListenPacket(network, "0.0.0.0:0")
-			if err != nil {
-				return err
-			}
-
-			RelAddr = locConn.LocalAddr().(*net.UDPAddr).IP.String()
-			RelPort = locConn.LocalAddr().(*net.UDPAddr).Port
-		} else {
+			TURNServerAddr := fmt.Sprintf("%s:%d", url.Host, url.Port)
 			var (
-				tcpAddr *net.TCPAddr
-				tcpConn *net.TCPConn
+				locConn net.PacketConn
+				err     error
+				RelAddr string
+				RelPort int
 			)
 
-			tcpAddr, err = net.ResolveTCPAddr(NetworkTypeTCP4.String(), TURNServerAddr)
+			if url.Proto == ProtoTypeUDP {
+				locConn, err = a.net.ListenPacket(NetworkTypeUDP4.String(), "0.0.0.0:0")
+				if err != nil {
+					a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+					return
+				}
+
+				RelAddr = locConn.LocalAddr().(*net.UDPAddr).IP.String()
+				RelPort = locConn.LocalAddr().(*net.UDPAddr).Port
+			} else {
+				var (
+					tcpAddr *net.TCPAddr
+					tcpConn *net.TCPConn
+				)
+
+				tcpAddr, err = net.ResolveTCPAddr(NetworkTypeTCP4.String(), TURNServerAddr)
+				if err != nil {
+					a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+					return
+				}
+
+				tcpConn, err = net.DialTCP(NetworkTypeTCP4.String(), nil, tcpAddr)
+				if err != nil {
+					a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+					return
+				}
+
+				RelAddr = tcpConn.LocalAddr().(*net.TCPAddr).IP.String()
+				RelPort = tcpConn.LocalAddr().(*net.TCPAddr).Port
+				locConn = turn.NewSTUNConn(tcpConn)
+			}
+
+			client, err := turn.NewClient(&turn.ClientConfig{
+				TURNServerAddr: TURNServerAddr,
+				Conn:           locConn,
+				Username:       url.Username,
+				Password:       url.Password,
+				LoggerFactory:  a.loggerFactory,
+				Net:            a.net,
+			})
 			if err != nil {
-				return err
+				a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+				return
 			}
 
-			tcpConn, err = net.DialTCP(NetworkTypeTCP4.String(), nil, tcpAddr)
+			err = client.Listen()
 			if err != nil {
-				return err
+				a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+				return
 			}
 
-			RelAddr = tcpConn.LocalAddr().(*net.TCPAddr).IP.String()
-			RelPort = tcpConn.LocalAddr().(*net.TCPAddr).Port
-			locConn = turn.NewSTUNConn(tcpConn)
-		}
-
-		client, err := turn.NewClient(&turn.ClientConfig{
-			TURNServerAddr: TURNServerAddr,
-			Conn:           locConn,
-			Username:       url.Username,
-			Password:       url.Password,
-			LoggerFactory:  a.loggerFactory,
-			Net:            a.net,
-		})
-		if err != nil {
-			return err
-		}
-
-		err = client.Listen()
-		if err != nil {
-			return err
-		}
-
-		relayConn, err := client.Allocate()
-		if err != nil {
-			return err
-		}
-
-		raddr := relayConn.LocalAddr().(*net.UDPAddr)
-
-		relayConfig := CandidateRelayConfig{
-			Network:   network,
-			Component: ComponentRTP,
-			Address:   raddr.IP.String(),
-			Port:      raddr.Port,
-			RelAddr:   RelAddr,
-			RelPort:   RelPort,
-			OnClose: func() error {
-				client.Close()
-				return locConn.Close()
-			},
-		}
-		candidate, err := NewCandidateRelay(&relayConfig)
-		if err != nil {
-			a.log.Warnf("Failed to create relay candidate: %s %s: %v\n",
-				network, raddr.String(), err)
-			continue
-		}
-
-		if err := a.run(func(agent *Agent) {
-			candidate.start(a, relayConn)
-			a.addCandidate(candidate)
-
-			if a.onCandidateHdlr != nil {
-				go a.onCandidateHdlr(candidate)
+			relayConn, err := client.Allocate()
+			if err != nil {
+				a.log.Warnf("Failed to gather relay candidate: %s: %v\n", TURNServerAddr, err)
+				return
 			}
-		}); err != nil {
-			a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v\n", err)
-		}
+
+			raddr := relayConn.LocalAddr().(*net.UDPAddr)
+			relayConfig := CandidateRelayConfig{
+				Network:   NetworkTypeUDP4.String(),
+				Component: ComponentRTP,
+				Address:   raddr.IP.String(),
+				Port:      raddr.Port,
+				RelAddr:   RelAddr,
+				RelPort:   RelPort,
+				OnClose: func() error {
+					client.Close()
+					return locConn.Close()
+				},
+			}
+			candidate, err := NewCandidateRelay(&relayConfig)
+			if err != nil {
+				a.log.Warnf("Failed to create relay candidate: %s %s: %v\n", NetworkTypeUDP4.String(), raddr.String(), err)
+				return
+			}
+
+			if err := a.run(func(agent *Agent) {
+				candidate.start(a, relayConn)
+				a.addCandidate(candidate)
+
+				if a.onCandidateHdlr != nil {
+					go a.onCandidateHdlr(candidate)
+				}
+			}); err != nil {
+				a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v\n", err)
+			}
+		}(val)
 	}
 
 	return nil
